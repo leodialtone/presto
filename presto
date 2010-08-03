@@ -1,0 +1,299 @@
+#!/bin/bash
+# 
+# PRESTO, Puppet Restore Tool
+#
+# Author: Hanno Liem <hanno@liem.cn>
+# March 2010
+
+BUCKETDIR=$( puppetd --configprint clientbucketdir ) 
+TMPFILE=$(mktemp)
+
+function get_backup_dir {
+ # Given a hash, find the full path to the directory.
+ find ${BUCKETDIR} -type d -name $1
+}
+
+function scan_clientbucket {
+  # Creates a tempfile with the timestamp, hash, date, and filename
+  # Sorted in oldest first.
+  
+  for f in $(find ${BUCKETDIR} -name paths)
+  do 
+    echo -e "$(date -r $f +%s)\t$(basename $(dirname $f))\t$(date -r $f)\t$(cat $f)"
+  done | sort -r -k 1 -n | awk -F "\t" '{ print $2 "\t" $3 "\t" $4 }' > ${TMPFILE}
+  if [[ "$1" == "" ]]
+  then
+    tac ${TMPFILE} > ${TMPFILE}-2
+  else
+    tac ${TMPFILE} | grep "$1" > ${TMPFILE}-2
+  fi
+  mv ${TMPFILE}-2 ${TMPFILE}
+}
+
+function restore_backups_from {
+  # Input: hash
+  # Take the tempfile created by scan_clientbucket
+  # Find the file by hash, then restore that hash
+  # And everything that is newer
+  
+  scan_clientbucket
+  tac ${TMPFILE} | sed -ne "1,/$1/p" > ${TMPFILE}-2
+  mv ${TMPFILE}-2 ${TMPFILE}
+  L=$(cat ${TMPFILE} | wc -l)
+  if [[ "$L" -eq "0" ]]
+  then
+    echo "Nothing found, sorry."
+  fi
+  for H in $(cat ${TMPFILE} | awk '{ print $1 }')
+  do
+    restore_file $H
+  done  
+}
+
+function restore_backups {
+  # Input: hash
+  # Just restore one file.
+  scan_clientbucket $1
+  for H in $(cat ${TMPFILE} | awk '{ print $1 }')
+  do
+    restore_file $H
+  done
+}
+
+function restore_file {
+  # Input: hash
+  # Restore one specific file
+  
+  HASH=$1
+  BACKUP_DIR=$(get_backup_dir "${HASH}")
+  SOURCE=${BACKUP_DIR}/contents
+  if [[ "$OUTPUT_PATH" == "" ]]
+  then
+    TARGET=$(cat ${BACKUP_DIR}/paths)
+  else
+    TARGET=${OUTPUT_PATH}
+  fi
+  
+  echo "Restoring ${HASH} ($(cat ${BACKUP_DIR}/paths) -> ${TARGET})"  
+
+  if [[ "$DRY_RUN" == "1" ]]
+  then
+    echo '(dry run)'
+  else
+    if [[ -f ${TARGET} && "${BACKUP}" -eq "1" ]]
+    then
+      echo Backup ${TARGET} to ${TARGET}.$(date +%s).backup
+      mv ${TARGET} ${TARGET}.$(date +%s).backup
+    fi
+    
+    if [[ "${FORCE}" == "1" ]]
+    then
+      cp ${SOURCE} ${TARGET}
+    else
+      cp -i ${SOURCE} ${TARGET}
+    fi
+  fi
+
+}
+
+
+function list_backups {
+  # Call scan_clientbucket
+  # Display tempfile
+  scan_clientbucket $1
+  cat ${TMPFILE} | less -EF
+}
+
+function list_backups_from {
+  # Input: hash
+  # Display the newest files all the way back until the
+  # file that belongs to the input hash
+  scan_clientbucket
+  tac ${TMPFILE} | sed -ne "1,/$1/p" > ${TMPFILE}-2
+  tac ${TMPFILE}-2 | less -EF
+  L=$(cat ${TMPFILE}-2 | wc -l)
+  if [[ "$L" -eq "0" ]]
+  then
+    echo "Nothing found, sorry."
+  fi
+}
+
+function show_help {
+  # Display help text
+  
+  cat << HERE
+presto - puppet restore tool
+View, diff and restore files from the Puppet clientbucket.
+
+Hanno Liem <hliem@ebay.com> / March 2010
+
+presto -[vD] <hash>
+presto -l [-n <hash> | -s <string> | -t <timestamp>]
+presto -r [-n <hash> | -t <timestamp>] [-f] -[b] [-o <path>]
+
+Options:
+
+-b			Create backup of all files overwritten during restore.
+-d			Dry run, do not restore but show what would be restored. Without -r this option is ignored.
+-D <hash>		Diff file associated with hash with the current version. Ignores all other flags.
+-f			Force overwrite existing files. Do not ask for confirmation.
+-h			Display help.
+-l			List files but do not restore anything. Ignores -r. 
+-n <hash>		Match all backup files including and newer than the hash. Ignores -s and -n.
+-o <output path>	Output file to this location. If omitted, restore to default location.
+-r			Restore file; ignored if -l option is also provided.
+
+-s <substring>		Search - can be a hash, directory name or filename. Can return multiple values.
+			Does a substring match. Ignored if -n or -t is provided.
+
+-t <timestamp>		Match all backup files made on <timestamp> and newer. <timestamp> is a UNIX timestamp.
+			Ignored if -n is provided. Ignores -s.
+
+-v <hash>		View file from backup. Ignores all other flags and options.
+
+
+Examples:
+
+  > presto -ln 2a260de06e350d8e8a0e184fe1f4de3b  
+  List file with the hash 2a260de06e350d8e8a0e184fe1f4de3b and all files more recently moved to the clientbucket.
+  
+  > presto -rn 2a260de06e350d8e8a0e184fe1f4de3b 
+  Restore all files same age or newer than the file with hash 2a260de06e350d8e8a0e184fe1f4de3b
+
+  > presto -rs 2a260de06e350d8e8a0e184fe1f4de3b 
+  Restore exactly this one file.
+  
+  > presto -ls ldap
+  Find all files containing the word 'ldap' in them.
+
+  > presto -v 55bac4e229c8a13d04bf8efe6d99bf3a  
+  View the contents of this file
+  
+  > presto -D 55bac4e229c8a13d04bf8efe6d99bf3a
+  Diff this backup file and the current 'live' one.
+  
+HERE
+
+}
+
+if [[ "$1" == "" ]]
+then
+  show_help
+  exit 0
+fi
+
+while getopts "v:D:ls:dn:rhbfo:t:" opt; do
+  case $opt in
+    b)
+      BACKUP=1
+      ;;
+    f)
+      FORCE=1
+      ;;
+    d)
+      DRY_RUN=1
+      ;;
+    D)
+      if [[ "$CMD" == "" ]]
+      then
+        CMD=DIFF
+        HASH=${OPTARG}
+      fi
+      ;;
+    h)
+      show_help
+      ;;
+    l)
+      CMD=LIST
+      ;;
+    n)
+      FROM_FILE=${OPTARG}
+      ;;
+    o)
+      OUTPUT_PATH=${OPTARG}
+      ;;
+    r)
+      if [[ "$CMD" == "" ]]
+      then
+        CMD=RESTORE
+      fi
+      ;;
+    s)
+      if [[ "$TIMESTAMP" == "" ]]
+      then
+        SEARCH=${OPTARG}
+      fi
+      ;;
+    t)
+      if [[ "$FROM_FILE" == "" ]]
+      then
+        TIMESTAMP=${OPTARG}
+        unset SEARCH
+      fi
+      ;;
+    v)
+      if [[ "$CMD" == "" ]]
+      then
+        CMD=VIEW
+        HASH=${OPTARG}
+      fi
+      ;;      
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :)
+      echo "Option -$OPTARG requires an argument." >&2
+      exit 1
+      ;;      
+  esac
+done
+
+if [[ "${FROM_FILE}" != "" && "${SEARCH}" != "" ]]
+then
+  echo '(ignoring -s)'
+  unset SEARCH
+fi
+
+case ${CMD} in
+  VIEW)
+    less -EF $(get_backup_dir ${HASH})/contents
+    exit
+    ;;
+  DIFF)
+    diff $(get_backup_dir ${HASH})/contents $(cat $(get_backup_dir ${HASH})/paths)
+    exit
+    ;;    
+  LIST)
+    if [[ "${SEARCH}" != "" ]]
+    then
+      # List all backups, with filter.
+      list_backups "${SEARCH}"
+    elif [[ "${FROM_FILE}" != "" ]]
+    then
+      # List backups since a certain file.
+      list_backups_from "${FROM_FILE}"
+    else
+      # List all backups.
+      list_backups
+    fi
+    ;;
+  RESTORE)
+    if [[ "${SEARCH}" != "" ]]
+    then
+      # List all backups, with filter.
+      restore_backups "${SEARCH}"
+    elif [[ "${FROM_FILE}" != "" ]]
+    then
+      # List backups since a certain file.
+      restore_backups_from "${FROM_FILE}"
+    else
+      # List all backups.
+      echo You need to specify what to restore.
+      exit 1
+    fi
+    ;;
+    
+esac
+    
+# rm ${TMPFILE}
